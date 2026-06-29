@@ -1,72 +1,31 @@
-# ContaPilot Cloudflare Simple
+# ContaPilot Worker
 
-Versión simplificada sin FastAPI/Render.
+Versión compatible con el flujo que Cloudflare te está mostrando: **Create a Worker**.
 
-## Qué cambia
+## Configuración Cloudflare
 
-Todo queda dentro de Cloudflare:
+- Build command: `npm install`
+- Deploy command: `npx wrangler deploy`
+- Root directory: `/`
 
-```txt
-Frontend: Cloudflare Pages
-API: Cloudflare Pages Functions
-Base de datos: Cloudflare D1
-```
+## D1
 
-Así evitamos Python, uvicorn, Render y servidores externos.
+1. Crea base D1 `contapilot_db`.
+2. Ejecuta el SQL de `migrations/0001_schema.sql` en la consola de D1.
+3. Copia el `database_id` de D1.
+4. Pégalo en `wrangler.toml` reemplazando `REPLACE_WITH_YOUR_D1_DATABASE_ID`.
 
-## Limitación inicial
+## Si falla por token
 
-Esta versión procesa XML/HTML/TXT. El soporte ZIP directo se puede agregar después con una librería JS o descomprimiendo en el navegador antes de enviar.
+Crea un API Token en Cloudflare con permisos:
 
-## Pasos
+- Account → Workers Scripts → Edit
+- Account → D1 → Edit
+- Account → Account Settings → Read
+- Zone → Workers Routes → Edit (opcional)
 
-1. Instala Wrangler:
+Luego en el proyecto, variables de entorno:
 
-```bash
-npm install -g wrangler
-```
+- `CLOUDFLARE_API_TOKEN` = token creado
+- `CLOUDFLARE_ACCOUNT_ID` = tu Account ID
 
-2. Login:
-
-```bash
-wrangler login
-```
-
-3. Crear D1:
-
-```bash
-wrangler d1 create contapilot_db
-```
-
-4. Copia el `database_id` que te da Cloudflare y pégalo en `wrangler.toml`.
-
-5. Ejecutar migración local:
-
-```bash
-wrangler d1 migrations apply contapilot_db --local
-```
-
-6. Probar local:
-
-```bash
-wrangler pages dev public --d1 DB=contapilot_db
-```
-
-7. Publicar:
-
-```bash
-wrangler pages deploy public --project-name contapilot
-```
-
-Para producción aplica migración remota:
-
-```bash
-wrangler d1 migrations apply contapilot_db --remote
-```
-
-## Abrir
-
-```txt
-/app.html
-/centro-facturas.html
-```
