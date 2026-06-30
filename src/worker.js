@@ -230,7 +230,7 @@ async function handleApi(request, env){ const url=new URL(request.url); const p=
     let result, status='error', imported=0, errors=0;
     try{
       const res=await fetch(`${serviceUrl}/sync`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});
-      result=await res.json().catch(async()=>({text:await res.text()}));
+      const responseText=await res.text(); try{ result=JSON.parse(responseText); }catch(_){ result={text:responseText}; }
       if(!res.ok) throw new Error(result.detail||result.error||('Servicio DIAN respondió '+res.status));
       status=result.ok?'success':'partial';
       const uploads=result.upload_result?.uploads||[];
