@@ -29,3 +29,28 @@ Luego en el proyecto, variables de entorno:
 - `CLOUDFLARE_API_TOKEN` = token creado
 - `CLOUDFLARE_ACCOUNT_ID` = tu Account ID
 
+
+## Conectar microservicio DIAN Sync
+
+Después de desplegar `contapilot_dian_sync_service` en Render/Railway/VPS, agrega una variable de entorno al Worker:
+
+- Nombre: `DIAN_SYNC_SERVICE_URL`
+- Valor: `https://TU-SERVICIO-DIAN.onrender.com`
+
+En Cloudflare:
+
+`Workers & Pages → contapilot → Settings → Variables → Add variable`
+
+Luego redeploy.
+
+El botón **Importar información** en el modal DIAN llamará a:
+
+`POST {DIAN_SYNC_SERVICE_URL}/sync`
+
+y enviará:
+
+- URL token DIAN
+- NIT empresa
+- fecha inicial
+- URL callback `/api/companies/{id}/upload`
+- token del usuario para subir los ZIP/XML procesados

@@ -207,13 +207,42 @@ async function handleApi(request, env){ const url=new URL(request.url); const p=
     return json(result);
   }
   m=p.match(/^\/companies\/([^/]+)\/dian-sync$/); if(m && request.method==='POST'){
-    await ensureCompany(env,user.id,m[1]); await ensureExtraSchema(env);
+    const company=await ensureCompany(env,user.id,m[1]); await ensureExtraSchema(env);
     const conn=await env.DB.prepare('SELECT * FROM dian_connections WHERE company_id=?').bind(m[1]).first(); if(!conn) throw new Error('Primero guarda la conexión DIAN');
-    const test=await testDianTokenUrl(conn.token_url);
-    const msg='Token validado en formato. Falta mapear los endpoints internos de DIAN para descargar XML automáticamente. Mientras tanto usa carga XML/ZIP manual.';
-    await env.DB.prepare('INSERT INTO dian_sync_logs VALUES (?,?,?,?,?,?,?)').bind(id(),m[1],test.format_ok?'pending_endpoint':'error',JSON.stringify({message:msg,test}),0, test.format_ok?0:1, now()).run();
-    await env.DB.prepare('UPDATE dian_connections SET status=?, last_sync_at=?, updated_at=? WHERE company_id=?').bind(test.format_ok?'pending_endpoint':'error', now(), now(), m[1]).run();
-    return json({ok:false, status:test.format_ok?'pending_endpoint':'error', message:msg, test});
+    const serviceUrl=(env.DIAN_SYNC_SERVICE_URL||'').replace(/\/$/,'');
+    if(!serviceUrl){
+      const test=await testDianTokenUrl(conn.token_url);
+      const msg='Conexión DIAN guardada, pero falta configurar DIAN_SYNC_SERVICE_URL para que ContaPilot llame al microservicio de sincronización.';
+      await env.DB.prepare('INSERT INTO dian_sync_logs VALUES (?,?,?,?,?,?,?)').bind(id(),m[1],'missing_service',JSON.stringify({message:msg,test}),0,1,now()).run();
+      return json({ok:false,status:'missing_service',message:msg,test});
+    }
+    const authHeader=request.headers.get('authorization')||'';
+    const payload={
+      token_url: conn.token_url,
+      company_nit: company.nit,
+      start_date: conn.start_date || new Date(Date.now()-30*24*3600*1000).toISOString().slice(0,10),
+      end_date: new Date().toISOString().slice(0,10),
+      max_documents: 50,
+      headless: true,
+      contapilot_upload_url: new URL(`/api/companies/${m[1]}/upload`, request.url).toString(),
+      contapilot_bearer_token: authHeader.replace(/^Bearer\s+/i,'')
+    };
+    let result, status='error', imported=0, errors=0;
+    try{
+      const res=await fetch(`${serviceUrl}/sync`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});
+      result=await res.json().catch(async()=>({text:await res.text()}));
+      if(!res.ok) throw new Error(result.detail||result.error||('Servicio DIAN respondió '+res.status));
+      status=result.ok?'success':'partial';
+      const uploads=result.upload_result?.uploads||[];
+      imported=uploads.reduce((acc,u)=>acc+((u.response?.imported||[]).length),0);
+      errors=(result.errors||[]).length + uploads.reduce((acc,u)=>acc+((u.response?.errors||[]).length),0);
+      if(errors && imported) status='partial'; else if(errors) status='error';
+    }catch(e){
+      result={error:e.message}; status='error'; errors=1;
+    }
+    await env.DB.prepare('INSERT INTO dian_sync_logs VALUES (?,?,?,?,?,?,?)').bind(id(),m[1],status,JSON.stringify(result),imported,errors,now()).run();
+    await env.DB.prepare('UPDATE dian_connections SET status=?, last_sync_at=?, updated_at=? WHERE company_id=?').bind(status,now(),now(),m[1]).run();
+    return json({ok:status==='success'||status==='partial',status,imported,errors,result});
   }
   m=p.match(/^\/companies\/([^/]+)\/dian-logs$/); if(m && request.method==='GET'){
     await ensureCompany(env,user.id,m[1]); await ensureExtraSchema(env);
