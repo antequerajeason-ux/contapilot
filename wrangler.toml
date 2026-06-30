@@ -5,10 +5,10 @@ compatibility_date = "2025-01-01"
 [assets]
 directory = "./public"
 binding = "ASSETS"
+[vars]
+DIAN_SYNC_SERVICE_URL = "https://contapilot-dian-sync-docker.onrender.com"
 
 [[d1_databases]]
 binding = "DB"
 database_name = "contapilot_db"
 database_id = "3ac40bbe-c3a0-4a3d-92d0-cacab0769946"
-[vars]
-DIAN_SYNC_SERVICE_URL = "https://contapilot-dian-sync-docker.onrender.com"
