@@ -9,4 +9,4 @@ binding = "ASSETS"
 [[d1_databases]]
 binding = "DB"
 database_name = "contapilot_db"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_id = "3ac40bbe-c3a0-4a3d-92d0-cacab0769946"
