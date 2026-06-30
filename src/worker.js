@@ -67,6 +67,53 @@ async function ensureExtraSchema(env){
     message TEXT,
     created_at TEXT NOT NULL
   )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS dian_connections (
+    company_id TEXT PRIMARY KEY,
+    person_type TEXT DEFAULT 'juridica',
+    representative_id_type TEXT DEFAULT 'CC',
+    representative_id TEXT,
+    company_nit TEXT,
+    token_url TEXT,
+    token_last4 TEXT,
+    start_date TEXT,
+    status TEXT DEFAULT 'saved',
+    last_test_at TEXT,
+    last_sync_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS dian_sync_logs (
+    id TEXT PRIMARY KEY,
+    company_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    message TEXT,
+    imported_count INTEGER DEFAULT 0,
+    error_count INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL
+  )`).run();
+}
+
+function parseDianAuthUrl(url){
+  let u;
+  try{ u=new URL(String(url||'')); }catch(e){ throw new Error('URL token DIAN inválida'); }
+  if(!u.hostname.includes('catalogo-vpfe.dian.gov.co')) throw new Error('El token debe pertenecer a catalogo-vpfe.dian.gov.co');
+  if(!u.pathname.toLowerCase().includes('/user/authtoken')) throw new Error('La URL debe ser de tipo /User/AuthToken');
+  const pk=u.searchParams.get('pk'), rk=u.searchParams.get('rk'), token=u.searchParams.get('token');
+  if(!pk || !rk || !token) throw new Error('La URL debe contener pk, rk y token');
+  return {pk,rk,token,last4:token.slice(-4),url:u.toString()};
+}
+async function testDianTokenUrl(url){
+  const parsed=parseDianAuthUrl(url);
+  let status=0, finalUrl='', ok=false;
+  try{
+    const res=await fetch(parsed.url,{method:'GET',redirect:'manual',headers:{'user-agent':'Mozilla/5.0 ContaPilot'}});
+    status=res.status; finalUrl=res.headers.get('location')||parsed.url;
+    ok = status>=200 && status<400;
+  }catch(e){
+    // Si Cloudflare/DIAN bloquea la prueba HTTP, al menos dejamos validado formato.
+    return {ok:false, format_ok:true, status:0, message:'Formato válido, pero no fue posible abrir DIAN desde Worker: '+e.message, parsed:{pk:parsed.pk,rk:parsed.rk,token_last4:parsed.last4}};
+  }
+  return {ok, format_ok:true, status, final_url:finalUrl, message:ok?'Token DIAN respondió. La sincronización real requiere endpoints internos del portal.':'DIAN respondió con estado '+status, parsed:{pk:parsed.pk,rk:parsed.rk,token_last4:parsed.last4}};
 }
 async function chooseRule(env, companyId, inv){ const rules=(await env.DB.prepare('SELECT * FROM accounting_rules WHERE company_id=? AND active=1 ORDER BY priority').bind(companyId).all()).results || []; const text=((inv.supplier_name||'')+' '+(inv.descriptions||'')).toUpperCase(); let fallback=null; for(const r of rules){ if(r.match_type==='default'){fallback=r; continue;} if(text.includes(String(r.match_value||'').toUpperCase())) return r; } return fallback; }
 async function generateEntry(env, invoiceId){ const inv=await env.DB.prepare('SELECT * FROM invoices WHERE id=?').bind(invoiceId).first(); if(!inv) throw new Error('Factura no encontrada'); const settings=await getSettings(env, inv.company_id); const items=(await env.DB.prepare('SELECT * FROM invoice_items WHERE invoice_id=?').bind(invoiceId).all()).results||[]; inv.descriptions=items.map(i=>i.description||'').join(' '); const rule=await chooseRule(env, inv.company_id, inv); let entry=await env.DB.prepare('SELECT * FROM accounting_entries WHERE invoice_id=?').bind(invoiceId).first(); let entryId=entry?.id || id(); if(entry){ await env.DB.prepare('DELETE FROM accounting_entry_lines WHERE entry_id=?').bind(entryId).run(); await env.DB.prepare("UPDATE accounting_entries SET status='suggested', confidence=?, created_at=?, approved_at=NULL WHERE id=?").bind(.88, now(), entryId).run(); } else { await env.DB.prepare('INSERT INTO accounting_entries VALUES (?,?,?,?,?,?)').bind(entryId, invoiceId, 'suggested', .88, now(), null).run(); }
@@ -137,6 +184,42 @@ async function handleApi(request, env){ const url=new URL(request.url); const p=
   }
   m=p.match(/^\/invoices\/([^/]+)\/generate-entry$/); if(m && request.method==='POST') return json(await generateEntry(env,m[1]));
   m=p.match(/^\/invoices\/([^/]+)\/approve$/); if(m && request.method==='POST'){ const entry=await env.DB.prepare('SELECT * FROM accounting_entries WHERE invoice_id=?').bind(m[1]).first(); if(!entry) await generateEntry(env,m[1]); const e=await env.DB.prepare('SELECT * FROM accounting_entries WHERE invoice_id=?').bind(m[1]).first(); await env.DB.prepare("UPDATE accounting_entries SET status='approved', approved_at=? WHERE id=?").bind(now(),e.id).run(); await env.DB.prepare("UPDATE invoices SET status='approved', updated_at=? WHERE id=?").bind(now(),m[1]).run(); return json({ok:true}); }
+  m=p.match(/^\/companies\/([^/]+)\/dian-connection$/); if(m && request.method==='GET'){
+    await ensureCompany(env,user.id,m[1]); await ensureExtraSchema(env);
+    const row=await env.DB.prepare('SELECT company_id, person_type, representative_id_type, representative_id, company_nit, token_last4, start_date, status, last_test_at, last_sync_at, created_at, updated_at FROM dian_connections WHERE company_id=?').bind(m[1]).first();
+    return json(row||null);
+  }
+  if(m && request.method==='POST'){
+    const company=await ensureCompany(env,user.id,m[1]); await ensureExtraSchema(env); const d=await request.json();
+    const parsed=parseDianAuthUrl(d.token_url);
+    const nit=nitClean(d.company_nit||company.nit);
+    if(nitClean(company.nit)!==nit) throw new Error('El NIT de conexión DIAN no coincide con la empresa activa');
+    const existing=await env.DB.prepare('SELECT company_id FROM dian_connections WHERE company_id=?').bind(m[1]).first();
+    if(existing) await env.DB.prepare('UPDATE dian_connections SET person_type=?, representative_id_type=?, representative_id=?, company_nit=?, token_url=?, token_last4=?, start_date=?, status=?, updated_at=? WHERE company_id=?').bind(d.person_type||'juridica',d.representative_id_type||'CC',d.representative_id||'',nit,parsed.url,parsed.last4,d.start_date||'', 'saved', now(), m[1]).run();
+    else await env.DB.prepare('INSERT INTO dian_connections VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').bind(m[1],d.person_type||'juridica',d.representative_id_type||'CC',d.representative_id||'',nit,parsed.url,parsed.last4,d.start_date||'', 'saved', null, null, now(), now()).run();
+    return json({ok:true, token_last4:parsed.last4, message:'Conexión DIAN guardada'});
+  }
+  m=p.match(/^\/companies\/([^/]+)\/dian-test$/); if(m && request.method==='POST'){
+    await ensureCompany(env,user.id,m[1]); await ensureExtraSchema(env);
+    const conn=await env.DB.prepare('SELECT * FROM dian_connections WHERE company_id=?').bind(m[1]).first(); if(!conn) throw new Error('Primero guarda la conexión DIAN');
+    const result=await testDianTokenUrl(conn.token_url);
+    await env.DB.prepare('UPDATE dian_connections SET status=?, last_test_at=?, updated_at=? WHERE company_id=?').bind(result.format_ok?'tested':'error', now(), now(), m[1]).run();
+    return json(result);
+  }
+  m=p.match(/^\/companies\/([^/]+)\/dian-sync$/); if(m && request.method==='POST'){
+    await ensureCompany(env,user.id,m[1]); await ensureExtraSchema(env);
+    const conn=await env.DB.prepare('SELECT * FROM dian_connections WHERE company_id=?').bind(m[1]).first(); if(!conn) throw new Error('Primero guarda la conexión DIAN');
+    const test=await testDianTokenUrl(conn.token_url);
+    const msg='Token validado en formato. Falta mapear los endpoints internos de DIAN para descargar XML automáticamente. Mientras tanto usa carga XML/ZIP manual.';
+    await env.DB.prepare('INSERT INTO dian_sync_logs VALUES (?,?,?,?,?,?,?)').bind(id(),m[1],test.format_ok?'pending_endpoint':'error',JSON.stringify({message:msg,test}),0, test.format_ok?0:1, now()).run();
+    await env.DB.prepare('UPDATE dian_connections SET status=?, last_sync_at=?, updated_at=? WHERE company_id=?').bind(test.format_ok?'pending_endpoint':'error', now(), now(), m[1]).run();
+    return json({ok:false, status:test.format_ok?'pending_endpoint':'error', message:msg, test});
+  }
+  m=p.match(/^\/companies\/([^/]+)\/dian-logs$/); if(m && request.method==='GET'){
+    await ensureCompany(env,user.id,m[1]); await ensureExtraSchema(env);
+    const rows=(await env.DB.prepare('SELECT * FROM dian_sync_logs WHERE company_id=? ORDER BY created_at DESC LIMIT 50').bind(m[1]).all()).results||[];
+    return json(rows);
+  }
   m=p.match(/^\/companies\/([^/]+)\/import-logs$/); if(m && request.method==='GET'){
     await ensureCompany(env,user.id,m[1]);
     await ensureExtraSchema(env);
@@ -153,13 +236,66 @@ async function handleApi(request, env){ const url=new URL(request.url); const p=
 }catch(e){ if(e instanceof Response) return e; return json({detail:e.message||String(e)},500); }}
 
 
+
+async function saveParsedInvoiceForCompany(env, company, parsed, sourceName='email'){
+  if(nitClean(parsed.customer_nit)!==nitClean(company.nit)) throw new Error(`Factura rechazada: receptor ${parsed.customer_nit} no coincide con empresa ${company.nit}`);
+  const exists=await env.DB.prepare('SELECT id FROM invoices WHERE company_id=? AND cufe=?').bind(company.id, parsed.cufe).first();
+  const finalId=exists?.id || id();
+  if(exists){
+    await env.DB.prepare('DELETE FROM invoice_items WHERE invoice_id=?').bind(finalId).run();
+    await env.DB.prepare('DELETE FROM accounting_entry_lines WHERE entry_id IN (SELECT id FROM accounting_entries WHERE invoice_id=?)').bind(finalId).run().catch(()=>{});
+    await env.DB.prepare('DELETE FROM accounting_entries WHERE invoice_id=?').bind(finalId).run().catch(()=>{});
+    await env.DB.prepare('UPDATE invoices SET invoice_number=?, issue_date=?, document_type=?, supplier_name=?, supplier_nit=?, customer_name=?, customer_nit=?, currency=?, subtotal=?, tax_amount=?, withholding_amount=?, payable_amount=?, status=?, raw_xml=?, updated_at=? WHERE id=?').bind(parsed.invoice_number,parsed.issue_date,parsed.document_type,parsed.supplier_name,parsed.supplier_nit,parsed.customer_name,parsed.customer_nit,parsed.currency,parsed.subtotal,parsed.tax_amount,parsed.withholding_amount,parsed.payable_amount,'received',parsed.invoice_xml,now(),finalId).run();
+  }else{
+    await env.DB.prepare('INSERT INTO invoices VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').bind(finalId,company.id,parsed.invoice_number,parsed.cufe,parsed.issue_date,parsed.document_type,parsed.supplier_name,parsed.supplier_nit,parsed.customer_name,parsed.customer_nit,parsed.currency,parsed.subtotal,parsed.tax_amount,parsed.withholding_amount,parsed.payable_amount,'received',parsed.invoice_xml,now(),now()).run();
+  }
+  for(const it of parsed.items) await env.DB.prepare('INSERT INTO invoice_items VALUES (?,?,?,?,?)').bind(id(),finalId,it.description,it.quantity,it.line_amount).run();
+  return {file:sourceName, invoice_id:finalId, invoice_number:parsed.invoice_number};
+}
+function decodeBase64ToBytes(b64){ const bin=atob(String(b64||'').replace(/\s/g,'')); const bytes=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i); return bytes; }
+function parseEmailAttachments(raw){
+  const out=[]; const header=raw.split(/\r?\n\r?\n/)[0]||''; const bm=header.match(/boundary="?([^";\r\n]+)"?/i); if(!bm) return out; const boundary=bm[1]; const parts=raw.split('--'+boundary);
+  for(const part of parts){
+    const [h,...rest]=part.split(/\r?\n\r?\n/); if(!rest.length) continue; const body=rest.join('\n\n').replace(/\r?\n--$/,'');
+    const filename=(h.match(/filename\*?=(?:UTF-8''|\")?([^";\r\n]+)/i)||h.match(/name\*?=(?:UTF-8''|\")?([^";\r\n]+)/i)||[])[1];
+    if(!filename) continue; const cleanName=decodeURIComponent(filename.replace(/"/g,'').trim()); const lower=cleanName.toLowerCase();
+    if(!['.xml','.html','.htm','.txt','.zip'].some(ext=>lower.endsWith(ext))) continue;
+    const enc=(h.match(/content-transfer-encoding:\s*([^\r\n]+)/i)||[])[1]?.toLowerCase()||'';
+    let bytes, textContent;
+    if(enc.includes('base64')){ bytes=decodeBase64ToBytes(body); if(!lower.endsWith('.zip')) textContent=new TextDecoder('utf-8').decode(bytes); }
+    else { textContent=body.trim(); bytes=new TextEncoder().encode(textContent); }
+    out.push({name:cleanName, bytes, text:textContent});
+  }
+  return out;
+}
+async function processIncomingEmail(message, env){
+  await ensureExtraSchema(env);
+  const to=message.to || message.headers?.get?.('to') || ''; const digits=nitClean((String(to).match(/[0-9]{6,}/)||[])[0]||'');
+  if(!digits){ await message.setReject('El correo receptor debe incluir el NIT de la empresa, por ejemplo 1002249038@tu-dominio.com'); return; }
+  const company=await env.DB.prepare('SELECT * FROM companies WHERE nit=? LIMIT 1').bind(digits).first();
+  if(!company){ await message.setReject(`No existe empresa configurada para NIT ${digits}`); return; }
+  const raw=await new Response(message.raw).text(); const attachments=parseEmailAttachments(raw); const imported=[], errors=[];
+  for(const att of attachments){
+    try{
+      if(att.name.toLowerCase().endsWith('.zip')){
+        const entries=await extractZipEntries(att.bytes.buffer);
+        for(const entry of entries){ try{ imported.push(await saveParsedInvoiceForCompany(env, company, await parseInvoice(entry.text), entry.name)); }catch(e){ errors.push({file:entry.name,error:e.message}); } }
+      }else imported.push(await saveParsedInvoiceForCompany(env, company, await parseInvoice(att.text), att.name));
+    }catch(e){ errors.push({file:att.name,error:e.message}); }
+  }
+  const status=errors.length&&imported.length?'partial':errors.length?'error':'success';
+  await env.DB.prepare('INSERT INTO import_logs VALUES (?,?,?,?,?,?,?,?)').bind(id(), company.id, `email:${message.from||''}`, status, imported.length, errors.length, JSON.stringify({imported,errors,from:message.from,to}), now()).run();
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname.startsWith('/api')) {
       return handleApi(request, env);
     }
-    // Serve static frontend assets from Cloudflare Workers assets
     return env.ASSETS.fetch(request);
+  },
+  async email(message, env, ctx) {
+    ctx.waitUntil(processIncomingEmail(message, env));
   }
 };
