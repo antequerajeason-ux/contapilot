@@ -14,6 +14,43 @@ function strip(s){ return String(s||'').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g,'$
 function num(v){ const n=Number(String(v||'0').replace(/[^0-9.-]/g,'')); return Number.isFinite(n)?n:0; }
 function innerUbl(src){ for(const tag of ['Invoice','CreditNote','DebitNote']){ const re=new RegExp(`<(?:\\w+:)?${tag}\\b[\\s\\S]*?<\\/(?:\\w+:)?${tag}>`,'i'); const m=String(src||'').match(re); if(m) return m[0]; } return null; }
 function extractInvoiceXml(input){ let raw=String(input||'').trim(); if(!raw) throw new Error('Archivo vacío'); if(/^(<\?xml[\s\S]*?\?>\s*)?<(?:\w+:)?(Invoice|CreditNote|DebitNote)\b/i.test(raw)) return raw; raw=raw.replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&'); const inner=innerUbl(raw); if(inner) return inner; throw new Error('No encontré Invoice/CreditNote/DebitNote dentro del archivo'); }
+function u16(bytes,pos){ return bytes[pos] | (bytes[pos+1] << 8); }
+function u32(bytes,pos){ return (bytes[pos] | (bytes[pos+1] << 8) | (bytes[pos+2] << 16) | (bytes[pos+3] << 24)) >>> 0; }
+async function inflateRaw(bytes){
+  if(typeof DecompressionStream === 'undefined') throw new Error('Este entorno no soporta descompresión ZIP automática. Sube el XML descomprimido.');
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+async function extractZipEntries(arrayBuffer){
+  const bytes = new Uint8Array(arrayBuffer);
+  let eocd = -1;
+  for(let i=bytes.length-22; i>=0 && i>bytes.length-66000; i--){ if(u32(bytes,i)===0x06054b50){ eocd=i; break; } }
+  if(eocd < 0) throw new Error('No pude leer el ZIP. Puede estar dañado o protegido.');
+  const total = u16(bytes,eocd+10);
+  let cdOffset = u32(bytes,eocd+16);
+  const decoder = new TextDecoder('utf-8');
+  const entries=[];
+  for(let n=0; n<total; n++){
+    if(u32(bytes,cdOffset)!==0x02014b50) break;
+    const method=u16(bytes,cdOffset+10), compSize=u32(bytes,cdOffset+20), nameLen=u16(bytes,cdOffset+28), extraLen=u16(bytes,cdOffset+30), commentLen=u16(bytes,cdOffset+32), localOffset=u32(bytes,cdOffset+42);
+    const name=decoder.decode(bytes.slice(cdOffset+46, cdOffset+46+nameLen));
+    cdOffset += 46 + nameLen + extraLen + commentLen;
+    if(name.endsWith('/')) continue;
+    const lower=name.toLowerCase();
+    if(!lower.endsWith('.xml') && !lower.endsWith('.html') && !lower.endsWith('.htm') && !lower.endsWith('.txt')) continue;
+    if(u32(bytes,localOffset)!==0x04034b50) continue;
+    const ln=u16(bytes,localOffset+26), le=u16(bytes,localOffset+28);
+    const dataStart=localOffset+30+ln+le;
+    const compressed=bytes.slice(dataStart, dataStart+compSize);
+    let contentBytes;
+    if(method===0) contentBytes=compressed;
+    else if(method===8) contentBytes=await inflateRaw(compressed);
+    else throw new Error(`El archivo ${name} usa compresión ZIP no soportada: ${method}`);
+    entries.push({name, text:decoder.decode(contentBytes)});
+  }
+  return entries;
+}
+
 function party(xml, partyTag){ const re=new RegExp(`<(?:\\w+:)?${partyTag}\\b[\\s\\S]*?<\/(?:\\w+:)?${partyTag}>`,'i'); const block=(xml.match(re)||[''])[0]; let name=tagText(block,'RegistrationName') || tagText(block,'Name'); let nit=tagText(block,'CompanyID') || tagText(block,'ID'); return {name,nit}; }
 async function parseInvoice(input){ const xml=extractInvoiceXml(input); const root=(xml.match(/<(?:\w+:)?(Invoice|CreditNote|DebitNote)\b/i)||[])[1] || 'Invoice'; const supplier=party(xml,'AccountingSupplierParty'); const customer=party(xml,'AccountingCustomerParty'); const invoiceNumber=tagText(xml,'ID'); const cufe=tagText(xml,'UUID') || await sha256(xml); const issueDate=tagText(xml,'IssueDate'); const currency=tagText(xml,'DocumentCurrencyCode') || 'COP'; const monetary=(xml.match(/<(?:\w+:)?LegalMonetaryTotal\b[\s\S]*?<\/(?:\w+:)?LegalMonetaryTotal>/i)||[''])[0]; const subtotal=num(tagText(monetary,'TaxExclusiveAmount') || tagText(monetary,'LineExtensionAmount')); const payable=num(tagText(monetary,'PayableAmount') || tagText(monetary,'TaxInclusiveAmount')) || subtotal; let tax=0; for(const m of xml.matchAll(/<(?:\w+:)?TaxTotal\b[\s\S]*?<\/(?:\w+:)?TaxTotal>/gi)){ tax += num(tagText(m[0],'TaxAmount')); } let withholding=0; for(const m of xml.matchAll(/<(?:\w+:)?WithholdingTaxTotal\b[\s\S]*?<\/(?:\w+:)?WithholdingTaxTotal>/gi)){ withholding += num(tagText(m[0],'TaxAmount')); } const lineTag=root==='CreditNote'?'CreditNoteLine':root==='DebitNote'?'DebitNoteLine':'InvoiceLine'; const qtyTag=root==='CreditNote'?'CreditedQuantity':root==='DebitNote'?'DebitedQuantity':'InvoicedQuantity'; const items=[]; const lineRe=new RegExp(`<(?:\\w+:)?${lineTag}\\b[\\s\\S]*?<\\/(?:\\w+:)?${lineTag}>`,'gi'); for(const m of xml.matchAll(lineRe)){ items.push({description:tagText(m[0],'Description'), quantity:num(tagText(m[0],qtyTag)), line_amount:num(tagText(m[0],'LineExtensionAmount'))}); } return {invoice_xml:xml, invoice_number:invoiceNumber, cufe, issue_date:issueDate, document_type:root==='Invoice'?'Factura compra':root==='CreditNote'?'Nota crédito':'Nota débito', supplier_name:supplier.name, supplier_nit:supplier.nit, customer_name:customer.name, customer_nit:customer.nit, currency, subtotal, tax_amount:tax, withholding_amount:withholding, payable_amount:payable, items}; }
 async function auth(env, request){ const h=request.headers.get('authorization')||''; if(!h.toLowerCase().startsWith('bearer ')) throw new Response(JSON.stringify({detail:'Falta token Authorization: Bearer'}),{status:401}); const token=h.split(' ')[1]; const row=await env.DB.prepare('SELECT u.* FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token=?').bind(token).first(); if(!row) throw new Response(JSON.stringify({detail:'Sesión inválida'}),{status:401}); return row; }
@@ -41,7 +78,39 @@ async function handleApi(request, env){ const url=new URL(request.url); const p=
   m=p.match(/^\/companies\/([^/]+)\/rules$/); if(m && request.method==='GET'){ await ensureCompany(env,user.id,m[1]); return json((await env.DB.prepare('SELECT * FROM accounting_rules WHERE company_id=? ORDER BY priority').bind(m[1]).all()).results||[]); }
   if(m && request.method==='POST'){ await ensureCompany(env,user.id,m[1]); const d=await request.json(); const rid=id(); await env.DB.prepare('INSERT INTO accounting_rules VALUES (?,?,?,?,?,?,?,?,?,?)').bind(rid,m[1],d.match_type,d.match_value,d.account,d.description,d.cost_center||'',d.priority||100,1,now()).run(); return json(await env.DB.prepare('SELECT * FROM accounting_rules WHERE id=?').bind(rid).first()); }
   m=p.match(/^\/companies\/([^/]+)\/invoices$/); if(m && request.method==='GET'){ await ensureCompany(env,user.id,m[1]); return json((await env.DB.prepare('SELECT * FROM invoices WHERE company_id=? ORDER BY issue_date DESC').bind(m[1]).all()).results||[]); }
-  m=p.match(/^\/companies\/([^/]+)\/upload$/); if(m && request.method==='POST'){ const company=await ensureCompany(env,user.id,m[1]); const fd=await request.formData(); const imported=[], errors=[]; for(const file of fd.getAll('file')){ try{ const xml=await file.text(); const parsed=await parseInvoice(xml); if(nitClean(parsed.customer_nit)!==nitClean(company.nit)) throw new Error(`Factura rechazada: receptor ${parsed.customer_nit} no coincide con empresa ${company.nit}`); const invoiceId=id(); const exists=await env.DB.prepare('SELECT id FROM invoices WHERE company_id=? AND cufe=?').bind(m[1],parsed.cufe).first(); const finalId=exists?.id||invoiceId; if(exists) await env.DB.prepare('DELETE FROM invoice_items WHERE invoice_id=?').bind(finalId).run(); if(exists) await env.DB.prepare('UPDATE invoices SET invoice_number=?, issue_date=?, document_type=?, supplier_name=?, supplier_nit=?, customer_name=?, customer_nit=?, currency=?, subtotal=?, tax_amount=?, withholding_amount=?, payable_amount=?, status=?, raw_xml=?, updated_at=? WHERE id=?').bind(parsed.invoice_number,parsed.issue_date,parsed.document_type,parsed.supplier_name,parsed.supplier_nit,parsed.customer_name,parsed.customer_nit,parsed.currency,parsed.subtotal,parsed.tax_amount,parsed.withholding_amount,parsed.payable_amount,'received',parsed.invoice_xml,now(),finalId).run(); else await env.DB.prepare('INSERT INTO invoices VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').bind(finalId,m[1],parsed.invoice_number,parsed.cufe,parsed.issue_date,parsed.document_type,parsed.supplier_name,parsed.supplier_nit,parsed.customer_name,parsed.customer_nit,parsed.currency,parsed.subtotal,parsed.tax_amount,parsed.withholding_amount,parsed.payable_amount,'received',parsed.invoice_xml,now(),now()).run(); for(const it of parsed.items) await env.DB.prepare('INSERT INTO invoice_items VALUES (?,?,?,?,?)').bind(id(),finalId,it.description,it.quantity,it.line_amount).run(); imported.push({file:file.name, invoice_id:finalId, invoice_number:parsed.invoice_number}); }catch(e){ errors.push({file:file.name,error:e.message}); }} return json({imported,errors}); }
+  m=p.match(/^\/companies\/([^/]+)\/upload$/); if(m && request.method==='POST'){
+    const company=await ensureCompany(env,user.id,m[1]);
+    const fd=await request.formData();
+    const imported=[], errors=[];
+    async function processOne(name, xml){
+      const parsed=await parseInvoice(xml);
+      if(nitClean(parsed.customer_nit)!==nitClean(company.nit)) throw new Error(`Factura rechazada: receptor ${parsed.customer_nit} no coincide con empresa ${company.nit}`);
+      const invoiceId=id();
+      const exists=await env.DB.prepare('SELECT id FROM invoices WHERE company_id=? AND cufe=?').bind(m[1],parsed.cufe).first();
+      const finalId=exists?.id||invoiceId;
+      if(exists) await env.DB.prepare('DELETE FROM invoice_items WHERE invoice_id=?').bind(finalId).run();
+      if(exists) await env.DB.prepare('UPDATE invoices SET invoice_number=?, issue_date=?, document_type=?, supplier_name=?, supplier_nit=?, customer_name=?, customer_nit=?, currency=?, subtotal=?, tax_amount=?, withholding_amount=?, payable_amount=?, status=?, raw_xml=?, updated_at=? WHERE id=?').bind(parsed.invoice_number,parsed.issue_date,parsed.document_type,parsed.supplier_name,parsed.supplier_nit,parsed.customer_name,parsed.customer_nit,parsed.currency,parsed.subtotal,parsed.tax_amount,parsed.withholding_amount,parsed.payable_amount,'received',parsed.invoice_xml,now(),finalId).run();
+      else await env.DB.prepare('INSERT INTO invoices VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').bind(finalId,m[1],parsed.invoice_number,parsed.cufe,parsed.issue_date,parsed.document_type,parsed.supplier_name,parsed.supplier_nit,parsed.customer_name,parsed.customer_nit,parsed.currency,parsed.subtotal,parsed.tax_amount,parsed.withholding_amount,parsed.payable_amount,'received',parsed.invoice_xml,now(),now()).run();
+      for(const it of parsed.items) await env.DB.prepare('INSERT INTO invoice_items VALUES (?,?,?,?,?)').bind(id(),finalId,it.description,it.quantity,it.line_amount).run();
+      imported.push({file:name, invoice_id:finalId, invoice_number:parsed.invoice_number});
+    }
+    for(const file of fd.getAll('file')){
+      try{
+        const lower=(file.name||'').toLowerCase();
+        if(lower.endsWith('.zip')){
+          const entries=await extractZipEntries(await file.arrayBuffer());
+          if(!entries.length){ errors.push({file:file.name,error:'El ZIP no contiene XML/HTML/TXT procesable'}); continue; }
+          for(const entry of entries){
+            try{ await processOne(entry.name, entry.text); }
+            catch(e){ errors.push({file:entry.name,error:e.message}); }
+          }
+        }else{
+          await processOne(file.name, await file.text());
+        }
+      }catch(e){ errors.push({file:file.name,error:e.message}); }
+    }
+    return json({imported,errors});
+  }
   m=p.match(/^\/invoices\/([^/]+)$/); if(m && request.method==='GET'){ const inv=await env.DB.prepare('SELECT * FROM invoices WHERE id=?').bind(m[1]).first(); if(!inv) return json({detail:'Factura no encontrada'},404); const entry=await env.DB.prepare('SELECT * FROM accounting_entries WHERE invoice_id=?').bind(m[1]).first(); const lines=entry?(await env.DB.prepare('SELECT * FROM accounting_entry_lines WHERE entry_id=?').bind(entry.id).all()).results||[]:[]; return json({invoice:inv,entry,lines}); }
   m=p.match(/^\/invoices\/([^/]+)\/generate-entry$/); if(m && request.method==='POST') return json(await generateEntry(env,m[1]));
   m=p.match(/^\/invoices\/([^/]+)\/approve$/); if(m && request.method==='POST'){ const entry=await env.DB.prepare('SELECT * FROM accounting_entries WHERE invoice_id=?').bind(m[1]).first(); if(!entry) await generateEntry(env,m[1]); const e=await env.DB.prepare('SELECT * FROM accounting_entries WHERE invoice_id=?').bind(m[1]).first(); await env.DB.prepare("UPDATE accounting_entries SET status='approved', approved_at=? WHERE id=?").bind(now(),e.id).run(); await env.DB.prepare("UPDATE invoices SET status='approved', updated_at=? WHERE id=?").bind(now(),m[1]).run(); return json({ok:true}); }
