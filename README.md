@@ -28,4 +28,5 @@ Luego en el proyecto, variables de entorno:
 
 - `CLOUDFLARE_API_TOKEN` = token creado
 - `CLOUDFLARE_ACCOUNT_ID` = tu Account ID
+- Update deploy
 
