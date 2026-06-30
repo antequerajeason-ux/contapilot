@@ -111,7 +111,14 @@ async function handleApi(request, env){ const url=new URL(request.url); const p=
     }
     return json({imported,errors});
   }
-  m=p.match(/^\/invoices\/([^/]+)$/); if(m && request.method==='GET'){ const inv=await env.DB.prepare('SELECT * FROM invoices WHERE id=?').bind(m[1]).first(); if(!inv) return json({detail:'Factura no encontrada'},404); const entry=await env.DB.prepare('SELECT * FROM accounting_entries WHERE invoice_id=?').bind(m[1]).first(); const lines=entry?(await env.DB.prepare('SELECT * FROM accounting_entry_lines WHERE entry_id=?').bind(entry.id).all()).results||[]:[]; return json({invoice:inv,entry,lines}); }
+  m=p.match(/^\/invoices\/([^/]+)$/); if(m && request.method==='GET'){
+    const inv=await env.DB.prepare('SELECT * FROM invoices WHERE id=?').bind(m[1]).first();
+    if(!inv) return json({detail:'Factura no encontrada'},404);
+    const items=(await env.DB.prepare('SELECT * FROM invoice_items WHERE invoice_id=?').bind(m[1]).all()).results||[];
+    const entry=await env.DB.prepare('SELECT * FROM accounting_entries WHERE invoice_id=?').bind(m[1]).first();
+    const lines=entry?(await env.DB.prepare('SELECT * FROM accounting_entry_lines WHERE entry_id=?').bind(entry.id).all()).results||[]:[];
+    return json({invoice:inv,items,entry,lines});
+  }
   m=p.match(/^\/invoices\/([^/]+)\/generate-entry$/); if(m && request.method==='POST') return json(await generateEntry(env,m[1]));
   m=p.match(/^\/invoices\/([^/]+)\/approve$/); if(m && request.method==='POST'){ const entry=await env.DB.prepare('SELECT * FROM accounting_entries WHERE invoice_id=?').bind(m[1]).first(); if(!entry) await generateEntry(env,m[1]); const e=await env.DB.prepare('SELECT * FROM accounting_entries WHERE invoice_id=?').bind(m[1]).first(); await env.DB.prepare("UPDATE accounting_entries SET status='approved', approved_at=? WHERE id=?").bind(now(),e.id).run(); await env.DB.prepare("UPDATE invoices SET status='approved', updated_at=? WHERE id=?").bind(now(),m[1]).run(); return json({ok:true}); }
   m=p.match(/^\/companies\/([^/]+)\/export\.csv$/); if(m && request.method==='GET'){ await ensureCompany(env,user.id,m[1]); const rows=(await env.DB.prepare('SELECT i.*, l.account, l.description line_description, l.debit, l.credit, l.cost_center FROM invoices i LEFT JOIN accounting_entries e ON e.invoice_id=i.id LEFT JOIN accounting_entry_lines l ON l.entry_id=e.id WHERE i.company_id=? ORDER BY i.issue_date DESC').bind(m[1]).all()).results||[]; const csv=['factura;fecha;proveedor;nit;cufe;cuenta;descripcion;debito;credito;centro_costo;estado',...rows.filter(r=>r.account).map(r=>[r.invoice_number,r.issue_date,r.supplier_name,r.supplier_nit,r.cufe,r.account,r.line_description,r.debit,r.credit,r.cost_center,r.status].map(v=>`"${String(v??'').replace(/"/g,'""')}"`).join(';'))].join('\n'); return text(csv,200,'text/csv; charset=utf-8'); }
