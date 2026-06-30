@@ -54,4 +54,3 @@ y enviará:
 - fecha inicial
 - URL callback `/api/companies/{id}/upload`
 - token del usuario para subir los ZIP/XML procesados
-- update env

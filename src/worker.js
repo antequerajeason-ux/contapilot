@@ -206,6 +206,39 @@ async function handleApi(request, env){ const url=new URL(request.url); const p=
     await env.DB.prepare('UPDATE dian_connections SET status=?, last_test_at=?, updated_at=? WHERE company_id=?').bind(result.format_ok?'tested':'error', now(), now(), m[1]).run();
     return json(result);
   }
+  m=p.match(/^\/companies\/([^/]+)\/dian-session-start$/); if(m && request.method==='POST'){
+    const company=await ensureCompany(env,user.id,m[1]); await ensureExtraSchema(env);
+    const conn=await env.DB.prepare('SELECT * FROM dian_connections WHERE company_id=?').bind(m[1]).first(); if(!conn) throw new Error('Primero guarda la conexión DIAN');
+    const serviceUrl=(env.DIAN_SYNC_SERVICE_URL||'').replace(/\/$/,''); if(!serviceUrl) throw new Error('Falta configurar DIAN_SYNC_SERVICE_URL');
+    const payload={token_url:conn.token_url, company_nit:company.nit, start_date:conn.start_date||new Date(Date.now()-30*24*3600*1000).toISOString().slice(0,10), end_date:new Date().toISOString().slice(0,10), max_documents:50};
+    const responseText=await fetch(`${serviceUrl}/sessions/start`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)}).then(r=>r.text().then(t=>({ok:r.ok,status:r.status,text:t})));
+    let result; try{result=JSON.parse(responseText.text)}catch(_){result={text:responseText.text}}
+    if(!responseText.ok) throw new Error(result.detail||result.error||('Servicio DIAN respondió '+responseText.status));
+    await env.DB.prepare('INSERT INTO dian_sync_logs VALUES (?,?,?,?,?,?,?)').bind(id(),m[1],'remote_session_started',JSON.stringify(result),0,0,now()).run();
+    return json(result);
+  }
+  m=p.match(/^\/companies\/([^/]+)\/dian-session-sync$/); if(m && request.method==='POST'){
+    const company=await ensureCompany(env,user.id,m[1]); await ensureExtraSchema(env);
+    const conn=await env.DB.prepare('SELECT * FROM dian_connections WHERE company_id=?').bind(m[1]).first(); if(!conn) throw new Error('Primero guarda la conexión DIAN');
+    const serviceUrl=(env.DIAN_SYNC_SERVICE_URL||'').replace(/\/$/,''); if(!serviceUrl) throw new Error('Falta configurar DIAN_SYNC_SERVICE_URL');
+    const body=await request.json(); if(!body.session_id) throw new Error('Falta session_id');
+    const authHeader=request.headers.get('authorization')||'';
+    const payload={session_id:body.session_id, company_nit:company.nit, start_date:conn.start_date||new Date(Date.now()-30*24*3600*1000).toISOString().slice(0,10), end_date:new Date().toISOString().slice(0,10), max_documents:50, contapilot_upload_url:new URL(`/api/companies/${m[1]}/upload`, request.url).toString(), contapilot_bearer_token:authHeader.replace(/^Bearer\s+/i,'')};
+    const r=await fetch(`${serviceUrl}/sessions/sync`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});
+    const responseText=await r.text(); let result; try{result=JSON.parse(responseText)}catch(_){result={text:responseText}}
+    let imported=0, errors=0; const uploads=result.upload_result?.uploads||[]; imported=uploads.reduce((a,u)=>a+((u.response?.imported||[]).length),0); errors=(result.errors||[]).length+uploads.reduce((a,u)=>a+((u.response?.errors||[]).length),0);
+    const status=r.ok?(errors&&imported?'partial':errors?'error':'success'):'error';
+    await env.DB.prepare('INSERT INTO dian_sync_logs VALUES (?,?,?,?,?,?,?)').bind(id(),m[1],status,JSON.stringify(result),imported,errors,now()).run();
+    await env.DB.prepare('UPDATE dian_connections SET status=?, last_sync_at=?, updated_at=? WHERE company_id=?').bind(status,now(),now(),m[1]).run();
+    if(!r.ok) throw new Error(result.detail||result.error||('Servicio DIAN respondió '+r.status));
+    return json({ok:status==='success'||status==='partial', status, imported, errors, result});
+  }
+  m=p.match(/^\/companies\/([^/]+)\/dian-session-close$/); if(m && request.method==='POST'){
+    await ensureCompany(env,user.id,m[1]); const serviceUrl=(env.DIAN_SYNC_SERVICE_URL||'').replace(/\/$/,''); if(!serviceUrl) throw new Error('Falta configurar DIAN_SYNC_SERVICE_URL');
+    const body=await request.json(); if(!body.session_id) throw new Error('Falta session_id');
+    const r=await fetch(`${serviceUrl}/sessions/${body.session_id}/close`,{method:'POST'}); const txt=await r.text(); let result; try{result=JSON.parse(txt)}catch(_){result={text:txt}}
+    return json(result,r.ok?200:r.status);
+  }
   m=p.match(/^\/companies\/([^/]+)\/dian-sync$/); if(m && request.method==='POST'){
     const company=await ensureCompany(env,user.id,m[1]); await ensureExtraSchema(env);
     const conn=await env.DB.prepare('SELECT * FROM dian_connections WHERE company_id=?').bind(m[1]).first(); if(!conn) throw new Error('Primero guarda la conexión DIAN');
