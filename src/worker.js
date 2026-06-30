@@ -56,6 +56,18 @@ async function parseInvoice(input){ const xml=extractInvoiceXml(input); const ro
 async function auth(env, request){ const h=request.headers.get('authorization')||''; if(!h.toLowerCase().startsWith('bearer ')) throw new Response(JSON.stringify({detail:'Falta token Authorization: Bearer'}),{status:401}); const token=h.split(' ')[1]; const row=await env.DB.prepare('SELECT u.* FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token=?').bind(token).first(); if(!row) throw new Response(JSON.stringify({detail:'Sesión inválida'}),{status:401}); return row; }
 async function ensureCompany(env,userId,companyId){ const c=await env.DB.prepare('SELECT * FROM companies WHERE id=? AND owner_user_id=?').bind(companyId,userId).first(); if(!c) throw new Response(JSON.stringify({detail:'Empresa no encontrada'}),{status:404}); return c; }
 async function getSettings(env, companyId){ return await env.DB.prepare('SELECT * FROM accounting_settings WHERE company_id=?').bind(companyId).first(); }
+async function ensureExtraSchema(env){
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS import_logs (
+    id TEXT PRIMARY KEY,
+    company_id TEXT NOT NULL,
+    file_name TEXT,
+    status TEXT NOT NULL,
+    imported_count INTEGER DEFAULT 0,
+    error_count INTEGER DEFAULT 0,
+    message TEXT,
+    created_at TEXT NOT NULL
+  )`).run();
+}
 async function chooseRule(env, companyId, inv){ const rules=(await env.DB.prepare('SELECT * FROM accounting_rules WHERE company_id=? AND active=1 ORDER BY priority').bind(companyId).all()).results || []; const text=((inv.supplier_name||'')+' '+(inv.descriptions||'')).toUpperCase(); let fallback=null; for(const r of rules){ if(r.match_type==='default'){fallback=r; continue;} if(text.includes(String(r.match_value||'').toUpperCase())) return r; } return fallback; }
 async function generateEntry(env, invoiceId){ const inv=await env.DB.prepare('SELECT * FROM invoices WHERE id=?').bind(invoiceId).first(); if(!inv) throw new Error('Factura no encontrada'); const settings=await getSettings(env, inv.company_id); const items=(await env.DB.prepare('SELECT * FROM invoice_items WHERE invoice_id=?').bind(invoiceId).all()).results||[]; inv.descriptions=items.map(i=>i.description||'').join(' '); const rule=await chooseRule(env, inv.company_id, inv); let entry=await env.DB.prepare('SELECT * FROM accounting_entries WHERE invoice_id=?').bind(invoiceId).first(); let entryId=entry?.id || id(); if(entry){ await env.DB.prepare('DELETE FROM accounting_entry_lines WHERE entry_id=?').bind(entryId).run(); await env.DB.prepare("UPDATE accounting_entries SET status='suggested', confidence=?, created_at=?, approved_at=NULL WHERE id=?").bind(.88, now(), entryId).run(); } else { await env.DB.prepare('INSERT INTO accounting_entries VALUES (?,?,?,?,?,?)').bind(entryId, invoiceId, 'suggested', .88, now(), null).run(); }
   const add=(account,description,debit,credit,cost='')=>env.DB.prepare('INSERT INTO accounting_entry_lines VALUES (?,?,?,?,?,?,?)').bind(id(), entryId, account, description, Number(debit||0), Number(credit||0), cost).run();
@@ -109,6 +121,10 @@ async function handleApi(request, env){ const url=new URL(request.url); const p=
         }
       }catch(e){ errors.push({file:file.name,error:e.message}); }
     }
+    await ensureExtraSchema(env);
+    const status = errors.length && imported.length ? 'partial' : errors.length ? 'error' : 'success';
+    const fileNames = [...fd.getAll('file')].map(f=>f.name).join(', ');
+    await env.DB.prepare('INSERT INTO import_logs VALUES (?,?,?,?,?,?,?,?)').bind(id(), m[1], fileNames, status, imported.length, errors.length, JSON.stringify({imported,errors}), now()).run();
     return json({imported,errors});
   }
   m=p.match(/^\/invoices\/([^/]+)$/); if(m && request.method==='GET'){
@@ -121,6 +137,17 @@ async function handleApi(request, env){ const url=new URL(request.url); const p=
   }
   m=p.match(/^\/invoices\/([^/]+)\/generate-entry$/); if(m && request.method==='POST') return json(await generateEntry(env,m[1]));
   m=p.match(/^\/invoices\/([^/]+)\/approve$/); if(m && request.method==='POST'){ const entry=await env.DB.prepare('SELECT * FROM accounting_entries WHERE invoice_id=?').bind(m[1]).first(); if(!entry) await generateEntry(env,m[1]); const e=await env.DB.prepare('SELECT * FROM accounting_entries WHERE invoice_id=?').bind(m[1]).first(); await env.DB.prepare("UPDATE accounting_entries SET status='approved', approved_at=? WHERE id=?").bind(now(),e.id).run(); await env.DB.prepare("UPDATE invoices SET status='approved', updated_at=? WHERE id=?").bind(now(),m[1]).run(); return json({ok:true}); }
+  m=p.match(/^\/companies\/([^/]+)\/import-logs$/); if(m && request.method==='GET'){
+    await ensureCompany(env,user.id,m[1]);
+    await ensureExtraSchema(env);
+    const rows=(await env.DB.prepare('SELECT * FROM import_logs WHERE company_id=? ORDER BY created_at DESC LIMIT 100').bind(m[1]).all()).results||[];
+    return json(rows);
+  }
+  m=p.match(/^\/companies\/([^/]+)\/mark-exported$/); if(m && request.method==='POST'){
+    await ensureCompany(env,user.id,m[1]);
+    const result=await env.DB.prepare("UPDATE invoices SET status='exported', updated_at=? WHERE company_id=? AND status IN ('approved','accounted')").bind(now(),m[1]).run();
+    return json({ok:true, changed: result.meta?.changes || 0});
+  }
   m=p.match(/^\/companies\/([^/]+)\/export\.csv$/); if(m && request.method==='GET'){ await ensureCompany(env,user.id,m[1]); const rows=(await env.DB.prepare('SELECT i.*, l.account, l.description line_description, l.debit, l.credit, l.cost_center FROM invoices i LEFT JOIN accounting_entries e ON e.invoice_id=i.id LEFT JOIN accounting_entry_lines l ON l.entry_id=e.id WHERE i.company_id=? ORDER BY i.issue_date DESC').bind(m[1]).all()).results||[]; const csv=['factura;fecha;proveedor;nit;cufe;cuenta;descripcion;debito;credito;centro_costo;estado',...rows.filter(r=>r.account).map(r=>[r.invoice_number,r.issue_date,r.supplier_name,r.supplier_nit,r.cufe,r.account,r.line_description,r.debit,r.credit,r.cost_center,r.status].map(v=>`"${String(v??'').replace(/"/g,'""')}"`).join(';'))].join('\n'); return text(csv,200,'text/csv; charset=utf-8'); }
   return json({detail:'Ruta no encontrada'},404);
 }catch(e){ if(e instanceof Response) return e; return json({detail:e.message||String(e)},500); }}
